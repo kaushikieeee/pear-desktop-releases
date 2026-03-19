@@ -1,0 +1,185 @@
+name: Manual Upstream Build and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repository:
+        description: Source repository to build from (owner/repo)
+        required: true
+        default: pear-devs/pear-desktop
+        type: string
+      source_ref:
+        description: Branch, tag, or commit SHA to build
+        required: true
+        default: master
+        type: string
+      release_tag:
+        description: Release tag in this repo (leave empty to use v<version>)
+        required: false
+        default: ''
+        type: string
+      release_name:
+        description: Release title (leave empty to use release tag)
+        required: false
+        default: ''
+        type: string
+      draft:
+        description: Create as draft release
+        required: true
+        default: false
+        type: boolean
+      prerelease:
+        description: Mark as prerelease
+        required: true
+        default: false
+        type: boolean
+
+env:
+  NODE_VERSION: '22.x'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: manual-upstream-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Resolve release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      source_repository: ${{ steps.meta.outputs.source_repository }}
+      source_ref: ${{ steps.meta.outputs.source_ref }}
+      app_version: ${{ steps.meta.outputs.app_version }}
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      release_name: ${{ steps.meta.outputs.release_name }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.source_repository }}
+          ref: ${{ inputs.source_ref }}
+
+      - name: Resolve metadata
+        id: meta
+        shell: bash
+        run: |
+          APP_VERSION="$(node -pe "require('./package.json').version")"
+
+          if [ -n "${{ inputs.release_tag }}" ]; then
+            RELEASE_TAG="${{ inputs.release_tag }}"
+          else
+            RELEASE_TAG="v${APP_VERSION}"
+          fi
+
+          if [ -n "${{ inputs.release_name }}" ]; then
+            RELEASE_NAME="${{ inputs.release_name }}"
+          else
+            RELEASE_NAME="${RELEASE_TAG}"
+          fi
+
+          echo "source_repository=${{ inputs.source_repository }}" >> "$GITHUB_OUTPUT"
+          echo "source_ref=${{ inputs.source_ref }}" >> "$GITHUB_OUTPUT"
+          echo "app_version=${APP_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "release_name=${RELEASE_NAME}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.os }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ needs.prepare.outputs.source_repository }}
+          ref: ${{ needs.prepare.outputs.source_ref }}
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+          run_install: false
+
+      - name: Setup NodeJS
+        if: startsWith(matrix.os, 'macOS') != true
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Setup NodeJS for macOS
+        if: startsWith(matrix.os, 'macOS')
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build on macOS (x64 and arm64)
+        if: startsWith(matrix.os, 'macOS')
+        run: |
+          pnpm dist:mac
+          pnpm dist:mac:arm64
+
+      - name: Install Linux dependencies
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo snap install snapcraft --classic
+          sudo apt update
+          sudo apt install -y flatpak flatpak-builder
+          sudo flatpak remote-add --if-not-exists --system flathub https://flathub.org/repo/flathub.flatpakrepo
+          sudo flatpak install -y flathub org.freedesktop.Platform/x86_64/24.08
+          sudo flatpak install -y flathub org.freedesktop.Sdk/x86_64/24.08
+          sudo flatpak install -y flathub org.electronjs.Electron2.BaseApp/x86_64/24.08
+
+      - name: Build on Linux (all available targets)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          pnpm dist:linux
+          pnpm dist:linux:deb-arm64
+          pnpm dist:linux:rpm-arm64
+
+      - name: Build on Windows
+        if: startsWith(matrix.os, 'windows')
+        run: pnpm dist:win
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          name: ${{ needs.prepare.outputs.release_name }}
+          draft: ${{ inputs.draft }}
+          prerelease: ${{ inputs.prerelease }}
+          generate_release_notes: true
+          files: artifacts/**/*
+          fail_on_unmatched_files: true
+          body: |
+            Automated build from `${{ needs.prepare.outputs.source_repository }}@${{ needs.prepare.outputs.source_ref }}`.
+
+            Source version: `${{ needs.prepare.outputs.app_version }}`

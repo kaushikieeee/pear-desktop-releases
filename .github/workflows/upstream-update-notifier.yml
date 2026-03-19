@@ -1,0 +1,118 @@
+name: Upstream Update Notifier
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      source_repository:
+        description: Source repository to monitor (owner/repo)
+        required: true
+        default: pear-devs/pear-desktop
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-update-notifier
+  cancel-in-progress: true
+
+jobs:
+  check-upstream:
+    name: Check upstream tags
+    runs-on: ubuntu-latest
+    steps:
+      - name: Detect latest upstream tag
+        id: upstream
+        uses: actions/github-script@v8
+        env:
+          SOURCE_REPOSITORY: ${{ github.event.inputs.source_repository || 'pear-devs/pear-desktop' }}
+        with:
+          script: |
+            const [owner, repo] = process.env.SOURCE_REPOSITORY.split('/');
+
+            if (!owner || !repo) {
+              core.setFailed(`Invalid source repository: ${process.env.SOURCE_REPOSITORY}`);
+              return;
+            }
+
+            const tags = await github.paginate(github.rest.repos.listTags, {
+              owner,
+              repo,
+              per_page: 10
+            });
+
+            if (!tags.length) {
+              core.setFailed(`No tags found in ${process.env.SOURCE_REPOSITORY}`);
+              return;
+            }
+
+            const latestTag = tags[0].name;
+
+            core.info(`Latest upstream tag: ${latestTag}`);
+            core.setOutput('latest_tag', latestTag);
+            core.setOutput('source_repository', process.env.SOURCE_REPOSITORY);
+
+      - name: Check if notification already exists
+        id: existing
+        uses: actions/github-script@v8
+        env:
+          LATEST_TAG: ${{ steps.upstream.outputs.latest_tag }}
+          SOURCE_REPOSITORY: ${{ steps.upstream.outputs.source_repository }}
+        with:
+          script: |
+            const marker = `[upstream-release:${process.env.SOURCE_REPOSITORY}@${process.env.LATEST_TAG}]`;
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100
+            });
+
+            const existing = issues.find((issue) => issue.body?.includes(marker));
+            core.setOutput('exists', existing ? 'true' : 'false');
+            core.setOutput('marker', marker);
+
+      - name: Create notification issue
+        if: steps.existing.outputs.exists != 'true'
+        uses: actions/github-script@v8
+        env:
+          LATEST_TAG: ${{ steps.upstream.outputs.latest_tag }}
+          SOURCE_REPOSITORY: ${{ steps.upstream.outputs.source_repository }}
+          MARKER: ${{ steps.existing.outputs.marker }}
+        with:
+          script: |
+            const runManualReleaseUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/workflows/manual-upstream-release.yml`;
+            const sourceReleaseUrl = `https://github.com/${process.env.SOURCE_REPOSITORY}/releases/tag/${process.env.LATEST_TAG}`;
+            const sourceTagUrl = `https://github.com/${process.env.SOURCE_REPOSITORY}/tree/${process.env.LATEST_TAG}`;
+
+            const title = `Upstream update available: ${process.env.LATEST_TAG}`;
+            const body = [
+              process.env.MARKER,
+              '',
+              `A new upstream tag was detected in **${process.env.SOURCE_REPOSITORY}**: **${process.env.LATEST_TAG}**.`,
+              '',
+              `- Upstream release: ${sourceReleaseUrl}`,
+              `- Upstream tag/tree: ${sourceTagUrl}`,
+              `- Trigger your release workflow: ${runManualReleaseUrl}`,
+              '',
+              'Suggested run inputs:',
+              `- source_repository: ${process.env.SOURCE_REPOSITORY}`,
+              `- source_ref: ${process.env.LATEST_TAG}`
+            ].join('\n');
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body
+            });
+
+      - name: Workflow summary
+        run: |
+          echo "## Upstream check result" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Source repo: ${{ steps.upstream.outputs.source_repository }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Latest tag: ${{ steps.upstream.outputs.latest_tag }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Issue already existed: ${{ steps.existing.outputs.exists }}" >> "$GITHUB_STEP_SUMMARY"
